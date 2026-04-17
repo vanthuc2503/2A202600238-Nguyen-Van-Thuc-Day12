@@ -28,6 +28,7 @@ COPY --from=builder /deps /usr/local
 # Copy application
 COPY app/ ./app/
 COPY utils/ ./utils/
+COPY web/ ./web/
 
 RUN chown -R agent:agent /app
 

@@ -22,14 +22,17 @@ from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import redis
-from fastapi import FastAPI, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
 
 from app.config import settings
 from app.auth import verify_api_key
-from app.rate_limiter import check_rate_limit, ping_redis
+from app.rate_limiter import check_rate_limit
+from app.redis_client import close_redis, get_redis, ping_redis
 from app.cost_guard import check_budget, estimate_cost_usd
 
 from utils.mock_llm import ask as mock_ask
@@ -49,32 +52,25 @@ _is_ready = False
 _request_count = 0
 _error_count = 0
 
-_redis: redis.Redis | None = None
-
 # ─────────────────────────────────────────────────────────
 # Lifespan
 # ─────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _is_ready, _redis
+    global _is_ready
     logger.info(json.dumps({
         "event": "startup",
         "app": settings.app_name,
         "version": settings.app_version,
         "environment": settings.environment,
     }))
-    _redis = redis.from_url(settings.redis_url, decode_responses=True)
     _is_ready = ping_redis()
     logger.info(json.dumps({"event": "ready", "redis": _is_ready}))
 
     yield
 
     _is_ready = False
-    try:
-        if _redis is not None:
-            _redis.close()
-    except Exception:
-        pass
+    close_redis()
     logger.info(json.dumps({"event": "shutdown"}))
 
 # ─────────────────────────────────────────────────────────
@@ -88,11 +84,14 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# Static UI (for testing deployed backend)
+app.mount("/static", StaticFiles(directory="web/static"), name="static")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in settings.allowed_origins.split(",")] if settings.allowed_origins else ["*"],
     allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-OpenAI-Key"],
 )
 
 @app.middleware("http")
@@ -150,8 +149,14 @@ def root():
             "ask": "POST /ask (requires X-API-Key)",
             "health": "GET /health",
             "ready": "GET /ready",
+            "ui": "GET /ui",
         },
     }
+
+
+@app.get("/ui", include_in_schema=False)
+def ui():
+    return FileResponse("web/index.html")
 
 
 @app.post("/ask", response_model=AskResponse, tags=["Agent"])
@@ -159,14 +164,19 @@ async def ask_agent(
     body: AskRequest,
     request: Request,
     _key: str = Depends(verify_api_key),
+    x_openai_key: str | None = Header(default=None, alias="X-OpenAI-Key"),
 ):
     """
     Send a question to the AI agent.
 
     **Authentication:** Include header `X-API-Key: <your-key>`
     """
-    if _redis is None:
-        raise HTTPException(status_code=503, detail="Redis not initialized")
+    r = get_redis()
+    if r is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis unavailable. Set REDIS_URL (Railway) and redeploy.",
+        )
 
     # Rate limit per user
     check_rate_limit(body.user_id)
@@ -182,7 +192,7 @@ async def ask_agent(
     }))
 
     history_key = f"history:{body.user_id}"
-    raw_history = _redis.lrange(history_key, -settings.history_max_messages, -1)
+    raw_history = r.lrange(history_key, -settings.history_max_messages, -1)
     history_count = len(raw_history)
 
     prompt = body.question
@@ -190,17 +200,18 @@ async def ask_agent(
         # Keep it simple: prepend compact history to the question
         prompt = "Conversation so far:\n" + "\n".join(raw_history) + "\n\nUser: " + body.question
 
-    if settings.openai_api_key:
-        answer = openai_ask(api_key=settings.openai_api_key, model=settings.llm_model, prompt=prompt)
+    openai_key = x_openai_key or settings.openai_api_key
+    if openai_key:
+        answer = openai_ask(api_key=openai_key, model=settings.llm_model, prompt=prompt)
         model_used = settings.llm_model
     else:
         answer = mock_ask(prompt)
         model_used = "mock"
 
     # Save to Redis (stateless)
-    _redis.rpush(history_key, f"User: {body.question}")
-    _redis.rpush(history_key, f"Assistant: {answer}")
-    _redis.expire(history_key, 7 * 24 * 3600)
+    r.rpush(history_key, f"User: {body.question}")
+    r.rpush(history_key, f"Assistant: {answer}")
+    r.expire(history_key, 7 * 24 * 3600)
 
     return AskResponse(
         user_id=body.user_id,
@@ -216,7 +227,7 @@ async def ask_agent(
 def health():
     """Liveness probe. Platform restarts container if this fails."""
     status = "ok"
-    checks = {"redis": bool(_redis is not None), "llm": "openai" if settings.openai_api_key else "mock"}
+    checks = {"redis": bool(get_redis() is not None), "llm": "openai" if settings.openai_api_key else "mock"}
     return {
         "status": status,
         "version": settings.app_version,
@@ -231,7 +242,7 @@ def health():
 @app.get("/ready", tags=["Operations"])
 def ready():
     """Readiness probe. Load balancer stops routing here if not ready."""
-    if not _is_ready or _redis is None:
+    if not _is_ready or get_redis() is None:
         raise HTTPException(503, "Not ready")
     if not ping_redis():
         raise HTTPException(503, "Redis not ready")

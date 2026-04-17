@@ -1,5 +1,6 @@
 """Production config — 12-Factor: tất cả từ environment variables."""
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,7 +23,8 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
 
     # Storage (stateless)
-    redis_url: str = "redis://localhost:6379/0"
+    # Railway Redis thường inject `REDIS_URL`
+    redis_url: str = Field(default="redis://localhost:6379/0", validation_alias="REDIS_URL")
 
     # CORS
     allowed_origins: str = "*"
