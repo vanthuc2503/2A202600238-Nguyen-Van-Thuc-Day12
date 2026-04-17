@@ -11,6 +11,12 @@ import sys
 import json
 import subprocess
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def check(name: str, passed: bool, detail: str = "") -> dict:
     icon = "✅" if passed else "❌"
